@@ -23,8 +23,11 @@ resuming — updated as each discovery is made. **Read top to bottom before acti
 
 ## Layout
 
-- `Strata/` — repo v0.1.41, `.venv/`, `setup.log`, `build/` (CMake build dir)
-- `Strata-data/` — model files (~58 GB download **not started yet**; build fails first)
+- `Strata/` — repo v0.1.41, `.venv/`, `setup.log`, `server.log`, `build/` (CMake build dir),
+  `engine/strata` (built engine), `run-coder-iq1_m.sh` (start script, env baked in),
+  `strata-coder-iq1_m.json` (server config)
+- `Strata-data/` — model files: **download complete** (both shards + `.done` markers,
+  58.4 GB); MTP draft layer extracted to `Strata-data/mtp/rt`
 - `~/cuda-13.0/` — CUDA Toolkit 13.0, installed locally from NVIDIA debs (no sudo)
 - `~/cuda-13.0/nvcc.sh` — nvcc wrapper (now **plain passthrough**; the rsqrt fix lives in a patched CUDA header — see §"Current blocker")
 - `~/.local/bin/{cmake,ninja}` — absolute symlinks into the venv (fix #6)
@@ -73,17 +76,23 @@ above is the canonical one. Setup is resumable — finished steps skip.)
 
 - [x] CMake configure succeeds; **full build done: 109/109 targets**, engine linked.
 - [x] Strata's own `.cu` files now compile (rsqrt fix applied — see "Current blocker").
-- [ ] Model download (~58 GB into `Strata-data/`) — **in progress** (file 1/2 ≈ 29.6 GB,
-      then file 2/2; resumable).
+- [x] Model download complete: both shards + `.done` markers (58.4 GB); MTP draft layer
+      extracted to `Strata-data/mtp/rt`.
 - [x] Engine binary `Strata/engine/strata` runs as-is: its interpreter is the Nix-store
       glibc 2.42 loader (`/nix/store/lm3pknxi0ipypy3lxh1wmm8wvvavdwrn-glibc-2.42-84/lib/ld-linux-x86-64.so.2`),
       a real loader, not the musl stub ⇒ **no patchelf needed**. `strata-vision` does not
       exist (BUILD.json: `"vision": "none"`).
-- [ ] Edit generated `Strata/run-coder-iq1_m.sh`: it only does `cd` +
-      `exec .venv/bin/python serve/server.py --engine strata --config ... --port 8080`;
-      add the two exports from the env block above (server.py itself prepends CUDA lib
-      dirs to LD_LIBRARY_PATH from config `lib_dirs`, so no CUDA paths needed there).
-- [ ] Start server, poll `http://127.0.0.1:8080/health`, send a test chat.
+- [x] Edited generated `Strata/run-coder-iq1_m.sh`: added the two exports
+      (LD_LIBRARY_PATH + SSL_CERT_FILE) before the exec line (server.py itself prepends
+      CUDA lib dirs to LD_LIBRARY_PATH from config `lib_dirs`, so no CUDA paths needed there).
+- [ ] **Start server, poll `/health`, send a test chat — USER DOES THIS LAST** (see
+      §"Starting the server"). Port 8080 is held by a user-owned `llama-server`
+      (started 2026-10-10 20:22 from `/home/ivan/llama-cpp`, serving
+      ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF IQ3_S multimodal) which also occupies
+      ~13.3 GB of the 5060 Ti's VRAM — Strata can't load alongside it, so it must be
+      stopped first. ⚠️ **This AI agent session runs ON that llama-server** — stopping
+      it kills this session, so the final start must be done by hand from a normal
+      terminal.
 
 ## Current blocker — RESOLVED (fix applied & verified)
 
@@ -192,6 +201,41 @@ Fallbacks if the header patch misbehaves:
 - Or use an older glibc dev package (e.g. 2.39) headers via `-isystem` if its math.h
   lacks the C23 rsqrt declaration (unverified which version added it).
 
+## Starting the server (final step — do by hand)
+
+Everything is installed and verified; only the start + verification remain. The AI agent
+session runs on the llama-server occupying port 8080, so **stop that first from a normal
+terminal** (this ends the agent session), then:
+
+```sh
+# 1. stop the old llama.cpp server (frees port 8080 + ~13 GB VRAM)
+pkill -f llama-server
+nvidia-smi                    # wait until the 5060 Ti shows ~0 MiB used
+
+# 2. start Strata (env exports are baked into the script; --open opens a browser tab)
+cd /home/ivan/strata-install/Strata
+nohup ./run-coder-iq1_m.sh > server.log 2>&1 &
+tail -f server.log            # first load takes a few minutes (58 GB model)
+
+# 3. verify
+curl -s http://127.0.0.1:8080/health        # → {"status":"ok"}
+curl -s http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"coder","messages":[{"role":"user","content":"Reply with exactly: OK"}]}'
+
+# 4. stop again later, if needed
+pkill -f 'serve/server.py'
+```
+
+Notes:
+- `./setup.sh` (no flags) also just starts the server — same as the run script.
+- API endpoints: OpenAI-compatible `http://127.0.0.1:8080/v1`, Anthropic-style
+  `http://127.0.0.1:8080/v1/messages`; any API key, model name can be anything.
+- If the PC freezes / screen goes black once when the model loads (#779): re-run setup
+  with `--vram-reserve-mib 1500`.
+- Several concurrent agents/clients: add `--conversation-cache-mib 8192` to the config's
+  args (otherwise each re-reads ~90% of its prompts; #882 #440).
+
 ## Pitfalls / notes for resuming
 
 - The old `-U_GNU_SOURCE` wrapper hack is gone (it broke libstdc++, error class 2);
@@ -209,8 +253,9 @@ Fallbacks if the header patch misbehaves:
   -S <Strata> -B <build> -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON
   -DSTRATA_BUILD_TESTS=OFF -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_CUDA_COMPILER=<nvcc>
   -DCUDAToolkit_ROOT=<toolkit> -DSTRATA_GGML_DIR=<llama.cpp>`.
-- Engine binary: `Strata/engine/strata` (EXE="strata"), vision encoder
-  `Strata/engine/strata-vision` (VEXE="strata-vision"). Both need patchelf after build.
+- Engine binary: `Strata/engine/strata` (EXE="strata"); no vision encoder in this build
+  (BUILD.json `"vision": "none"`). **No patchelf needed** — its interpreter is the
+  Nix-store glibc 2.42 loader, which works (verified with `--help`).
 - `serve/server.py` `child_env()` prepends `cfg["lib_dirs"]` to LD_LIBRARY_PATH for the
   engine process — CUDA lib paths handled at runtime by the server itself.
 - Real g++ (bypassing NixOS wrapper): `/nix/store/8sjgd7q3mdks1rb7rbcv0sallhvrhai5-gcc-15.3.0/bin/g++`.
