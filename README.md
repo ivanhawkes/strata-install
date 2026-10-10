@@ -26,7 +26,7 @@ resuming — updated as each discovery is made. **Read top to bottom before acti
 - `Strata/` — repo v0.1.41, `.venv/`, `setup.log`, `build/` (CMake build dir)
 - `Strata-data/` — model files (~58 GB download **not started yet**; build fails first)
 - `~/cuda-13.0/` — CUDA Toolkit 13.0, installed locally from NVIDIA debs (no sudo)
-- `~/cuda-13.0/nvcc.sh` — nvcc wrapper (**currently contains `-Xcompiler -U_GNU_SOURCE` — see §"Current blocker", this must change**)
+- `~/cuda-13.0/nvcc.sh` — nvcc wrapper (now **plain passthrough**; the rsqrt fix lives in a patched CUDA header — see §"Current blocker")
 - `~/.local/bin/{cmake,ninja}` — absolute symlinks into the venv (fix #6)
 - `/tmp/cudatest/` — minimal `.cu` repro files from earlier diagnosis (may still exist)
 
@@ -71,20 +71,42 @@ above is the canonical one. Setup is resumable — finished steps skip.)
 
 ## Progress so far (latest run)
 
-- [x] CMake **configure now succeeds** (compiler-ID test passes with the wrapper).
-- [x] Ninja build started; **14/121 objects compiled** (all ggml-cpu .cpp/.c fine).
-- [x] Strata's own `.cu` files fail: `src/core/device.cu` (6 errors),
-      `src/core/pinned.cu` (29 errors) — see "Current blocker".
-- [ ] Model download (~58 GB into `Strata-data/`) — not started.
-- [ ] After build: patchelf engine binary `Strata/engine/strata` (+ `strata-vision` if
-      present) with the glibc 2.44 loader (same command as fix #1).
+- [x] CMake configure succeeds; **full build done: 109/109 targets**, engine linked.
+- [x] Strata's own `.cu` files now compile (rsqrt fix applied — see "Current blocker").
+- [ ] Model download (~58 GB into `Strata-data/`) — **in progress** (file 1/2 ≈ 29.6 GB,
+      then file 2/2; resumable).
+- [x] Engine binary `Strata/engine/strata` runs as-is: its interpreter is the Nix-store
+      glibc 2.42 loader (`/nix/store/lm3pknxi0ipypy3lxh1wmm8wvvavdwrn-glibc-2.42-84/lib/ld-linux-x86-64.so.2`),
+      a real loader, not the musl stub ⇒ **no patchelf needed**. `strata-vision` does not
+      exist (BUILD.json: `"vision": "none"`).
 - [ ] Edit generated `Strata/run-coder-iq1_m.sh`: it only does `cd` +
       `exec .venv/bin/python serve/server.py --engine strata --config ... --port 8080`;
       add the two exports from the env block above (server.py itself prepends CUDA lib
       dirs to LD_LIBRARY_PATH from config `lib_dirs`, so no CUDA paths needed there).
 - [ ] Start server, poll `http://127.0.0.1:8080/health`, send a test chat.
 
-## Current blocker (fully diagnosed; fix NOT yet applied)
+## Current blocker — RESOLVED (fix applied & verified)
+
+**RESOLVED.** Applied exactly the recommended fix below:
+1. Patched `~/cuda-13.0/usr/local/cuda-13.0/targets/x86_64-linux/include/crt/math_functions.h`:
+   `rsqrt`/`rsqrtf` are now declared
+   `extern "C" __DEVICE_FUNCTIONS_DECL__ __device_builtin__ ... noexcept(true)`
+   (matches glibc's IEC_60559_FUNCS_EXT_C23 decl; `__THROW` == `noexcept(true)` in C++17).
+2. Reverted `~/cuda-13.0/nvcc.sh` to plain passthrough (`_GNU_SOURCE` restored).
+3. Verified: `/tmp/cudatest/test_fix.cu` (includes cuda_runtime.h, cmath, cwchar, mutex,
+   atomic; calls rsqrt/rsqrtf host+device) compiles clean with
+   `nvcc.sh -std=c++17 -arch=sm_120`.
+4. Full Strata build then succeeded: 109/109 targets, engine linked and runs (`--help` OK).
+
+Extra verification done while patching (refines the diagnosis below):
+- glibc 2.42's C23 guard declares scalar `rsqrt` (bits/mathcalls.h:206) — the **only**
+  real conflict. `sinpi/cospi/tanpi` are declared there as SIMD vector variants only
+  (`__MATHCALL_VEC`), so CUDA's scalar versions never conflict; glibc 2.42 declares no
+  `rsqrtf` at all; `compoundn/pown/powr/rootn` are glibc-only (CUDA never declares them).
+- If the CUDA debs are ever re-extracted, re-apply the header patch (two lines, marked
+  "NixOS patch" in math_functions.h).
+
+Diagnosis below kept for reference.
 
 ### Error class 1 — rsqrt conflict (fixed by `-U_GNU_SOURCE`, but that fix is wrong)
 
@@ -140,7 +162,7 @@ glibc headers (read-only Nix store): `/nix/store/lbjwxax9n0457lgd83rqwpd1l9lgfl7
 - Exact expansion of `__GLIBC_USE(IEC_60559_FUNCS_EXT_C23)` in features.h **not yet
   verified** — empirically `_GNU_SOURCE` triggers it.
 
-### Recommended fix (next session, in order)
+### Recommended fix (APPLIED — see note at top of this section)
 
 1. **Patch the local CUDA header** (writable copy!) `math_functions.h`: make lines 629
    and 653 compatible with glibc's declaration, e.g.:
@@ -172,7 +194,8 @@ Fallbacks if the header patch misbehaves:
 
 ## Pitfalls / notes for resuming
 
-- **Do NOT keep `-U_GNU_SOURCE`** — verified to break libstdc++ (error class 2 above).
+- The old `-U_GNU_SOURCE` wrapper hack is gone (it broke libstdc++, error class 2);
+  the permanent fix is the patched CUDA header. `_GNU_SOURCE` is back and fine now.
 - Don't wipe `Strata/build/`; setup re-passes all `-D` flags each run, overriding stale
   CMake cache values.
 - Watch progress: `tail -f Strata/setup.log`. Silence during compile is normal (ninja +
