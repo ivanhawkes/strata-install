@@ -6,9 +6,42 @@ resuming — updated as each discovery is made. **Read top to bottom before acti
 
 ## Mission & choices
 
-- Goal: Strata **Coder IQ1_M** (~58 GB, coding-focused per user) running locally at
-  `http://127.0.0.1:8080`, then verify `/health` + a test chat.
+- Goal (superseded — see §"TARGET configuration" below): Strata **Coder IQ1_M** (~58 GB, coding-focused per user)
+  running locally at `http://127.0.0.1:8080`, then verify `/health` + a test chat.
 - Server stays bound to 127.0.0.1; prefer user-level changes (no sudo available).
+
+## TARGET configuration — what the user wants the server running with (2026-10-11 00:1x)
+
+**The user's requested run, verbatim — this is the configuration to end up with:**
+
+```sh
+./setup.sh --gpus 0,1 --family qwen --model IQ3_XXS --kv int8 --vision no --context 131072 --experimental-speed-projection off
+```
+
+Meaning of every flag, as setup reads it:
+
+| Flag | Value | Effect on this PC |
+|---|---|---|
+| `--gpus 0,1` | nvidia-smi numbering | **both** cards, layers split across them: GPU 0 = RTX 5060 Ti (sm_120, 16 GB) + GPU 1 = RTX 4060 (sm_89, 8 GB) |
+| `--family qwen` | full Qwen3.8-Flash-Next | **not** the `coder` family used by the run that is live now |
+| `--model IQ3_XXS` | 3-bit i-quant | download **76 GB**, uses ~**43 GB RAM** (step 1 menu text) |
+| `--kv int8` | 8-bit KV cache | same as the live config |
+| `--vision no` | images off | no vision encoder compiled (`BUILD.json "vision": "none"`) |
+| `--context 131072` | 128 k ctx | **double** the live config's 65536 |
+| `--experimental-speed-projection off` | — | no experimental speed projection |
+
+That run reached Step 4 and stopped there (CUDA toolkit not found — see §"the segfault on the last run").
+Everything already done is kept, so re-running with the right env resumes at Step 4.
+
+Consequences of this target that the rest of the file does **not** yet reflect:
+- It replaces the live IQ1_M/coder/1-GPU/65536 pair — the target config's own config file is
+  `Strata/strata-qwen-iq3_xxs.json`, a **new** file that needs the manual patches re-applied (fix #7 `lib_dirs`,
+  `fit_max_tokens`).
+- `--gpus 0,1` forces a **full engine rebuild** for `-DCMAKE_CUDA_ARCHITECTURES=120;89` (BUILD.json currently
+  `"archs": [120]`, no PTX). The Hardware table's "GPU 2 … too small to share (< 12 GB min)" verdict was for the
+  IQ1_M run; with this command setup printed `[ok] GPUs: GPU 0 … + GPU 1 … together`, so the 4060 is admitted here.
+- ~43 GB RAM for the model + the live pair's 29 GB RSS does not fit in 63 GB: the old pair must be stopped first.
+- RAM right now: 30.5 GB available of 63 GB (`free -b`), GPU 0 at 15640/16311 MiB.
 
 ## Hardware (verified)
 
@@ -384,6 +417,79 @@ real machine reboot it may bind :8080 before Strata. Never assume the port is St
 check `curl -s http://127.0.0.1:8080/health` returns Strata's **JSON** (open_webui answers HTML/404 there)
 and `ss -ltnp | grep 8080` shows which PID owns it.
 
+## 2026-10-11 00:0x — the segfault on the last run: it was PI, not Strata
+
+The user's last agent run died with a SIGSEGV. **Strata did not crash** — the agent process (`pi`) did.
+
+Evidence (`coredumpctl`):
+```
+Sun 2026-10-11 00:02:00 AEST  PID 104363  UID 1000  SIGSEGV  present  /nix/store/...-nodejs-slim-24.20.0/bin/node  24.9M
+```
+`coredumpctl info 104363`: `Command Line: pi`, `Control Group: .../app-niri-alacritty-103901.scope`,
+core `core.pi.1000.8bad9d4c….104363….zst` (24.9 MB). Stack of the faulting thread, innermost first:
+`v8::GlobalHandles::Destroy` ← `ManagedObjectFinalizer::WeakCallbackInfo` ← `GlobalHandles::InvokeFirstPassWeakCallbacks`
+← `Heap::PerformGarbageCollection` ← `Heap::CollectGarbage` ← `PushAllRegistersAndIterateStack` ← `MinorGCJob::Task::RunInternal`
+← `node::PerIsolatePlatformData::RunForegroundTask` ← `uv__async_io` / `uv__io_poll`.
+So it died **inside node's own minor-GC global-handle teardown**, reached from a libuv callback — the usual signature of
+a native addon holding a bad `v8::GlobalHandle`. The core's module list includes `clipboard.linux-x64-gnu.node`
+(a native addon pi loads); everything else listed is node's own deps. Nothing Strata-related.
+
+- No `strata` / `server.py` core anywhere near that time: the only `core.llama-server.*` cores are from **Oct 4**
+  (old llama.cpp experiments); the rest on this box are brave / codium / Discord / krita / nautilus.
+- The crashed session is pi session `01a12611-cd34-779c-bbbe-dbd6653e06f0` (started 2026-10-10 23:47:43 local,
+  105 messages, last entry 14:01:50Z = **00:01:50 local**, 9 s before the core's timestamp 00:01:59).
+- The Strata pair **103575 (server.py) → 103621 (engine)**, started 23:47:17, survived the crash and is still
+  serving: `ss -ltnp` → one LISTEN on `127.0.0.1:8080` pid 103575; `/health` → `{"status":"ok",…,"loaded":true}`;
+  both logs still being written at 00:11. Engine RSS 29.1 GB, GPU 0 `15640/16311 MiB`, GPU 1 idle (13 MiB).
+- Practical lesson: a pi/node segfault ends the **session**, not the **server**. Check the pair before doing
+  anything — here nothing had to be restarted, only the session was lost.
+
+### What that crashed session was doing (recovered from its jsonl tail)
+
+Its last ~10 minutes were probing the **TARGET** setup invocation above, and it never got past Step 4:
+
+```
+=== Step 4: the Strata engine ===
+  [ok] llama.cpp 3cf0325 (gguf-py, ggml, mtmd)
+  The engine has to be compiled for your PC, which needs: the NVIDIA CUDA Toolkit 13.0.
+  [X]  missing: the NVIDIA CUDA Toolkit 13.0 (the automatic install is only done on Ubuntu/Debian)
+Setup stopped. Fix the item above and run it again - everything already done is kept and skipped.
+```
+
+**Root cause** (`Strata/setup.py`: `install_build_tools` ~3026, `find_nvcc` ~1235): with no `STRATA_NVCC` in the
+environment, `find_nvcc()` only tries `shutil.which("nvcc")`, then `$CUDA_PATH/bin/nvcc` and `$CUDA_HOME/bin/nvcc`,
+then `/usr/local/cuda*/bin/nvcc` and `/opt/cuda*/bin/nvcc`. Our toolkit lives at
+`~/cuda-13.0/usr/local/cuda-13.0/bin/nvcc` — a **home** directory, matched by none of those globs — so `nvcc is None`,
+`missing` gets "the NVIDIA CUDA Toolkit 13.0", and since `shutil.which("apt-get") is None` on NixOS it hard-fails
+with exactly that message. Nothing is broken; the env exports from §"Environment for running setup" were simply
+missing in that shell.
+
+**Fix (verified, not yet re-run)**: re-run the same command with the canonical exports —
+`STRATA_NVCC=/home/ivan/cuda-13.0/nvcc.sh` is the only nvcc considered, and
+`/home/ivan/cuda-13.0/nvcc.sh --version` prints `Cuda compilation tools, release 13.0, V13.0.88`,
+which is what `find_nvcc` greps (`release (\d+)\.(\d+)` → (13,0)); build 88 also clears `CUDA_SM120_FIXED_BUILD = 86`.
+(`CUDA_HOME=/home/ivan/cuda-13.0/usr/local/cuda-13.0` would work too, but `STRATA_NVCC` is the documented, proven path.)
+
+**Three things that run will do, all of which conflict with the live pair — read before starting it:**
+1. **Full engine rebuild.** `engine/BUILD.json` has `"archs": [120]` and no `ptx`; `--gpus 0,1` adds the 4060
+   (sm_89), so `new_arch = local and not set(archs) <= built` is True → cmake is re-run with
+   `-DCMAKE_CUDA_ARCHITECTURES=120;89` (10–20 min) and `Strata/engine/strata` is **overwritten** while the
+   IQ1_M pair still runs on the old inode. `toolkit_root_defs(nvcc)` will also pass
+   `-DCUDAToolkit_ROOT=/home/ivan` (`Path(nvcc).resolve().parent.parent` of `cuda-13.0/nvcc.sh`) — that is what
+   the 20:29 build already did and it linked fine, so it is cosmetic, not a blocker.
+2. **VRAM/RAM.** The live pair holds 15.6 GB of 16.3 GB on GPU 0 and 29.1 GB RSS; `free -b` now shows only
+   **30.5 GB available** of 63 GB. IQ3_XXS is quoted at ~43 GB RAM, so the old pair **must be stopped first**
+   (by PID, server.py first — see the restart recipe), which ends this agent session.
+3. **It will start a server.** The command has no `--no-start`, so the last step binds :8080 and starts a second
+   pair; with the old pair still loaded that engine dies on the weight-arena `cudaMalloc`. Add `--no-start`, then
+   start deliberately once the port and VRAM are free.
+
+Also note the new config file will be `Strata/strata-qwen-iq3_xxs.json` (a **new** file, not the existing
+`strata-coder-iq1_m.json`), so the two manual patches from §"NixOS problems found" have to be re-applied to it
+once setup writes it: `lib_dirs` + the nvidia-x11 dir (fix #7) and `fit_max_tokens = true`.
+
+Disk is fine: 617 GB free on `/`, `Strata-data/models` is 55 GB, IQ3_XXS downloads 76 GB.
+
 ## Pitfalls / notes for resuming
 
 - Don't start the server twice: you get TWO server.py + TWO engine processes; only one
@@ -425,8 +531,9 @@ and `ss -ltnp | grep 8080` shows which PID owns it.
 - Real g++ (bypassing NixOS wrapper): `/nix/store/8sjgd7q3mdks1rb7rbcv0sallhvrhai5-gcc-15.3.0/bin/g++`.
 - glibc 2.44 store path: `/nix/store/h4wfwic161kxrr74jlzla5lsm28hgary-glibc-2.44-25`.
 
-Live pair as of 2026-10-10 22:38: server.py **92970** → engine **93016** (started 22:34:01, owns :8080,
-serving this session). `"fit_max_tokens": true` in `strata-coder-iq1_m.json` is LIVE — re-verified after the
-restart with a `max_tokens: 65530` request → 200 `"content":"OK"`. The 22:14 pair (85701/85748) was stopped
-by the user's restart; my own 22:14:27 attempt (server.py 85139) raced it and died on the weight-arena
-cudaMalloc — see §"Issues found on the 2026-10-10 22:14 restart" and §"Restart 2026-10-10 22:34".
+Live pair as of 2026-10-11 00:15: server.py **103575** → engine **103621** (both started 2026-10-10 23:47:17,
+ownes :8080, serving this session; RSS 29.1 GB, GPU 0 15640/16311 MiB). That pair still runs the **old** config
+(coder IQ1_M, one GPU, ctx 65536) — the **TARGET** config in §"TARGET configuration" is not up yet: its setup run
+stopped at Step 4 (CUDA toolkit not found). The pi session that ran on this pair (`01a12611…`, 23:47:43) died of a
+**node/pi SIGSEGV at 00:01:59** — see §"the segfault on the last run" — the pair itself stayed healthy. The 22:34
+pair (92970/93016) was stopped by the user's restart at 23:47; the 22:14 pair (85701/85748) by the one before it.
