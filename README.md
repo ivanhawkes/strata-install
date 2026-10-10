@@ -58,6 +58,20 @@ This box: `/lib64/ld-linux-x86-64.so.2` is a **musl stub** and `ldconfig -p` is
    `find_tool()` returned `.venv/bin/ninja` (relative) → CMake's scratch-dir try_compile
    failed. Fixed: absolute symlinks in `~/.local/bin` (already on PATH), which
    `shutil.which` finds first.
+7. **libcuda.so.1 not found at runtime** — no system linker cache (`ldconfig -p`
+   empty) and no `/usr/lib*` entry for the NVIDIA driver ⇒ the engine's cudart
+   `dlopen("libcuda.so.1")` fails, and cudart reports that as
+   **`CUDA driver version is insufficient for CUDA runtime version`
+   (`cudaErrorInsufficientDriver`)** — misleading: it means "driver library not
+   found", not "too old" (the store's libcuda is 615.71.09 / UMD 13.4, verified via
+   `cuDriverGetVersion` → 13040 ≥ CUDA 13.0's requirement). Symptom: engine died at
+   `native embedding: cannot pin 322 MiB: ... nor place it in VRAM`, with
+   `PCIe probe failed` just before (same root cause). Fixed: added
+   `/nix/store/pd39xk8fwx0sk2ay4spk8gvlgsqxbxkx-nvidia-x11-615.71.09/lib` to
+   `lib_dirs` in `strata-coder-iq1_m.json` — server.py's `child_env()` prepends
+   `lib_dirs` to the engine's `LD_LIBRARY_PATH`. Verified: engine now passes the PCIe
+   probe (14.5 GB/s → pcie_frac 0.40) and pins the 322 MiB embedding, then proceeds to
+   weight upload (OOM there only while llama-server still holds ~13.3 GB VRAM).
 
 ## Environment for running setup (canonical resume command)
 
@@ -85,14 +99,17 @@ above is the canonical one. Setup is resumable — finished steps skip.)
 - [x] Edited generated `Strata/run-coder-iq1_m.sh`: added the two exports
       (LD_LIBRARY_PATH + SSL_CERT_FILE) before the exec line (server.py itself prepends
       CUDA lib dirs to LD_LIBRARY_PATH from config `lib_dirs`, so no CUDA paths needed there).
-- [ ] **Start server, poll `/health`, send a test chat — USER DOES THIS LAST** (see
-      §"Starting the server"). Port 8080 is held by a user-owned `llama-server`
-      (started 2026-10-10 20:22 from `/home/ivan/llama-cpp`, serving
-      ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF IQ3_S multimodal) which also occupies
-      ~13.3 GB of the 5060 Ti's VRAM — Strata can't load alongside it, so it must be
-      stopped first. ⚠️ **This AI agent session runs ON that llama-server** — stopping
-      it kills this session, so the final start must be done by hand from a normal
-      terminal.
+- [x] Engine starts and initialises CUDA after fix #7 (libcuda on the engine's
+      library path); it loads the native embedding + pack and proceeds to weight
+      upload — only remaining blocker is llama-server's VRAM.
+- [x] **Server started, `/health` ok, chat works — DONE (2026-10-10 21:33).** llama-server
+      was stopped by hand, then `./run-coder-iq1_m.sh` started: server.py PID 74241 →
+      engine PID 74287, bound to 127.0.0.1:8080. `/health` →
+      `{"status":"ok","model":"qwen3.8-flash-next-coder-iq1_m","loaded":true}`; test chat
+      and this agent session now run ON Strata (~19.5 tok/s decode, prefill ~1513 tok/s,
+      expert-cache 51.4% hits, engine uses ~9 GB VRAM of the 5060 Ti). ⚠️ Stopping the
+      engine now kills this agent session. (Started twice by accident; the orphan pair
+      killed — see Pitfalls.)
 
 ## Current blocker — RESOLVED (fix applied & verified)
 
@@ -201,16 +218,16 @@ Fallbacks if the header patch misbehaves:
 - Or use an older glibc dev package (e.g. 2.39) headers via `-isystem` if its math.h
   lacks the C23 rsqrt declaration (unverified which version added it).
 
-## Starting the server (final step — do by hand)
+## Starting the server (DONE — restart recipe)
 
-Everything is installed and verified; only the start + verification remain. The AI agent
-session runs on the llama-server occupying port 8080, so **stop that first from a normal
-terminal** (this ends the agent session), then:
+The server is RUNNING (see §"Progress so far"). To restart it (e.g. after a reboot, or to
+change args): stop the current pair first — ⚠️ that ends any agent session running on it —
+then:
 
 ```sh
-# 1. stop the old llama.cpp server (frees port 8080 + ~13 GB VRAM)
-pkill -f llama-server
-nvidia-smi                    # wait until the 5060 Ti shows ~0 MiB used
+# 1. stop the running Strata server (frees port 8080 + its ~9 GB VRAM)
+pkill -f 'serve/server.py'      # safe ONLY when no agent session runs on it
+nvidia-smi                      # wait until the 5060 Ti shows ~0 MiB used
 
 # 2. start Strata (env exports are baked into the script; --open opens a browser tab)
 cd /home/ivan/strata-install/Strata
@@ -222,9 +239,6 @@ curl -s http://127.0.0.1:8080/health        # → {"status":"ok"}
 curl -s http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"coder","messages":[{"role":"user","content":"Reply with exactly: OK"}]}'
-
-# 4. stop again later, if needed
-pkill -f 'serve/server.py'
 ```
 
 Notes:
@@ -237,6 +251,13 @@ Notes:
   args (otherwise each re-reads ~90% of its prompts; #882 #440).
 
 ## Pitfalls / notes for resuming
+
+- Don't start the server twice: you get TWO server.py + TWO engine processes; only one
+  pair binds 8080, the orphan pair silently burns ~20 GB RAM + ~6 GB VRAM. Find the owner
+  with `ss -ltnp | grep 8080` (server.py PID) and its engine child (PPID), then `kill`
+  the ORPHAN pair by explicit PID — server.py first, then its engine (else server.py may
+  respawn one). Never blind-`pkill -f 'serve/server.py'` while an agent session runs on
+  the server: it kills the serving one too.
 
 - The old `-U_GNU_SOURCE` wrapper hack is gone (it broke libstdc++, error class 2);
   the permanent fix is the patched CUDA header. `_GNU_SOURCE` is back and fine now.
