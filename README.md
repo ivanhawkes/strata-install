@@ -490,8 +490,54 @@ once setup writes it: `lib_dirs` + the nvidia-x11 dir (fix #7) and `fit_max_toke
 
 Disk is fine: 617 GB free on `/`, `Strata-data/models` is 55 GB, IQ3_XXS downloads 76 GB.
 
+### Late findings (2026-10-11 00:2x), verified by running setup.py's own functions
+
+`setup.py` has an `if __name__ == "__main__"` guard (line 5553), so it can be `exec_module`'d in a scratch python
+process to call its helpers without running setup. Both directions of the CUDA check were confirmed this way:
+
+| env | `find_nvcc()` returns | consequence |
+|---|---|---|
+| `STRATA_NVCC=/home/ivan/cuda-13.0/nvcc.sh` | `('/home/ivan/cuda-13.0/nvcc.sh', (13, 0))` | Step 4 passes; `toolkit_root_defs` → `-DCUDAToolkit_ROOT=/home/ivan` |
+| (unset) | `('/nix/store/md4nmzmvly0y5m8qpw14gi5n26ninjr1-cuda12.9-cuda_nvcc-12.9.86/bin/nvcc', (12, 9))` | **a CUDA 12.9 nvcc does exist on this box** (the devenv's nix-store `cuda_nvcc`), but `need_cuda = (13,0)` for `max(archs) >= 120` → `cuda_v < need_cuda` → "missing: the NVIDIA CUDA Toolkit 13.0" → no `apt-get` → hard fail. Exactly the pasted message. |
+
+So the fix is only the env export; do **not** let setup pick the 12.9 nvcc (sm_120 + CUDA 12.8/12.9 engines crashed
+on long prompts upstream — #220/#224 — and `--cuda 12` is the experimental path, not what the user asked for).
+
+**NEW hazard (reasoned from `build_engine`, not yet observed)**: after compiling, `build_engine` does
+`shutil.copy2(bdir/EXE, eng/EXE)` — it **truncates and rewrites `Strata/engine/strata` in place**. The live engine
+runs from that very path, so its file-backed mappings change size mid-run → SIGBUS/SIGSEGV in the engine. The
+engine rebuild for `120;89` must therefore happen **after** the live pair is stopped, not while it serves.
+
+**To check before the run**: `FAMILIES` (setup.py:267) gives each family its own shard pattern and expert profile —
+the coder entry uses `"profile": "expert-profile-coder.bin"` (line 289), and `Strata/data/` also holds
+`expert-profile.bin` (196 KB, the shipped default) plus `draft_vocab*.bin` and an
+`experimental-speed-projection/` dir. Read `FAMILIES` fully to know which profile the `qwen` family wants, so the
+run does not silently reuse the coder profile.
+
+### Ordered next action (the user runs it; it ends this agent session)
+
+```sh
+# 0. stop the live pair BY PID, server.py first (103575 = server.py, 103621 = engine)
+kill 103575 103621; until ! pgrep -f 'engine/strata' >/dev/null; do sleep 2; done
+nvidia-smi --query-gpu=memory.used --format=csv     # want ~13 MiB on GPU 0 before starting anything
+
+# 1. re-run the TARGET command with the canonical env (see §"Environment for running setup"), plus --no-start
+STRATA_NVCC=/home/ivan/cuda-13.0/nvcc.sh \
+LD_LIBRARY_PATH=/nix/store/h4wfwic161kxrr74jlzla5lsm28hgary-glibc-2.44-25/lib \
+SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+./setup.sh --gpus 0,1 --family qwen --model IQ3_XXS --kv int8 --vision no --context 131072 \
+  --experimental-speed-projection off --yes --no-start
+
+# 2. patch the NEW config Strata/strata-qwen-iq3_xxs.json: lib_dirs + nvidia-x11 dir (fix #7), fit_max_tokens=true
+# 3. start it only once :8080 is free and GPU 0 VRAM is back (see §"Starting the server")
+```
+
+Watch `Strata/setup.log` during the 10–20 min compile (silence is normal). The 76 GB download is resumable.
+
 ## Pitfalls / notes for resuming
 
+- `shutil.copy2` in `build_engine` rewrites `Strata/engine/strata` **in place**: never let a setup run rebuild the
+  engine while an engine is serving — the truncate invalidates its mappings (SIGBUS/SIGSEGV). Stop the pair first.
 - Don't start the server twice: you get TWO server.py + TWO engine processes; only one
   pair binds 8080, the orphan pair silently burns ~20 GB RAM + ~6 GB VRAM. Find the owner
   with `ss -ltnp | grep 8080` (server.py PID) and its engine child (PPID), then `kill`
