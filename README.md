@@ -113,7 +113,8 @@ above is the canonical one. Setup is resumable — finished steps skip.)
 - [x] **Live pair 2026-10-10 22:20: server.py 85701 → engine 85748** (started 22:14:08, owns
       :8080, serves this session) with `--max-context 65536 --kv int8 --kv-resident 32768` and
       `"fit_max_tokens": true` now LIVE. Restart issues found and documented — see §"Issues
-      found on the 2026-10-10 22:14 restart".
+      found on the 2026-10-10 22:14 restart". **Superseded by the 22:34 restart — see §"Restart
+      2026-10-10 22:34".**
 
 ## Current blocker — RESOLVED (fix applied & verified)
 
@@ -346,6 +347,43 @@ kernels run on AVX-2`, `MAP_HUGETLB unavailable ... transparent huge pages reque
 `prefill: the CPU share is ON ... answers can differ slightly from 0.1.40.3` — all expected on
 this box; `STRATA_PREFILL_CPU_SHARE=0` turns the last one off.
 
+## Restart 2026-10-10 22:34 — the user rebooted the server; state re-verified (all healthy)
+
+The user stopped the 22:14 pair and started a new one at **22:34:01**: **server.py 92970 → engine 93016**
+(`ps -o lstart` shows both at 22:34:01, engine PPID 92970). This agent session (pi session
+`01a125d1-0689-76c6-896c-e8500cee636c`, started 22:36:58) is a **fresh** session running on that pair —
+the restart ended the previous one, exactly as the warning above says. The **machine** was not rebooted
+then (`last -x`: last reboot `Sat Oct 10 09:02`, uptime 13:36 at 22:38) — only the Strata pair.
+
+Verified after the restart (all OK, nothing needed re-applying):
+- `ss -ltnp | grep :8080` → exactly ONE LISTEN, `127.0.0.1:8080`, pid **92970**; no orphan pair, no
+  second engine anywhere in `ps`.
+- Warm reload: `loaded 23.42 GiB at 2.90 GiB/s` (15 s — the 58 GB was still in the page cache from the
+  previous run; `Cached: 26 GB` now), PCIe probe 14.5 GB/s → `pcie_frac 0.40` (fix #7 still working),
+  expert arena `cudaHostRegister PORTABLE ok`, expert cache **4211 slots / 8.02 GiB** pre-filled in 0.6 s,
+  `428 MiB of VRAM free with everything loaded` (then 221–395 MiB across the 1–6-token verify windows).
+- GPU: 5060 Ti `15566/16311 MiB` used, `--query-compute-apps` → engine 93016 holds `14576 MiB` (+ nautilus
+  73 MiB), 4060 idle (13 MiB). Engine RSS 29.0 GB.
+- `/health` → `{"status":"ok","max_context":65536,"model":"qwen3.8-flash-next-coder-iq1_m",…, "loaded":true,
+  "service":"strata"}`; test chat 200 `"content":"OK"`.
+- `fit_max_tokens` still LIVE (re-tested with the cheap recipe): `max_tokens: 65530` on a 57-token prompt →
+  **200** `"content":"OK"`. `strata-coder-iq1_m.json` mtime 22:02, `fit_max_tokens = True`, `lib_dirs` still
+  lists the nvidia-x11 dir.
+- All NixOS fixes survived: glibc-2.44 / nvidia-x11-615.71.09 / glibc-2.42 store dirs present, `ldconfig -p`
+  still **empty (0 lines)**, engine interpreter still the 2.42 loader, uv python still patchelf'd to the 2.44
+  loader, `~/.local/bin/{cmake,ninja}` symlinks intact, `.venv/bin/activate` exports intact, `nvcc.sh` still
+  plain passthrough, `math_functions.h` "NixOS patch" lines still at 629/657. `/tmp/cudatest/test_fix.cu`
+  + `test_fix.o` still there (/tmp was not touched by a server restart — only by a machine reboot).
+- Steady state on this session: prefill 1160–1330 tok/s (11.7 k of 14.1 k prompt tokens reused), decode
+  **36–38 tok/s**, expert-cache hit 78–85%, KV streaming 99.3–99.7% VRAM hits, suffix drafts ~6/8 accepted.
+
+**NEW neighbour on this box** (found while re-checking the port): **open_webui** runs as root (PID 2137,
+started at boot 09:02:14, `uvicorn open_webui.main:app --host 0.0.0.0 --port 8080`). It holds **no** :8080
+socket now (`ss -ltnp` has no `0.0.0.0:8080` line), but it is a boot-time service on the same port — after a
+real machine reboot it may bind :8080 before Strata. Never assume the port is Strata's: after every start
+check `curl -s http://127.0.0.1:8080/health` returns Strata's **JSON** (open_webui answers HTML/404 there)
+and `ss -ltnp | grep 8080` shows which PID owns it.
+
 ## Pitfalls / notes for resuming
 
 - Don't start the server twice: you get TWO server.py + TWO engine processes; only one
@@ -387,9 +425,8 @@ this box; `STRATA_PREFILL_CPU_SHARE=0` turns the last one off.
 - Real g++ (bypassing NixOS wrapper): `/nix/store/8sjgd7q3mdks1rb7rbcv0sallhvrhai5-gcc-15.3.0/bin/g++`.
 - glibc 2.44 store path: `/nix/store/h4wfwic161kxrr74jlzla5lsm28hgary-glibc-2.44-25`.
 
-Live pair as of 2026-10-10 22:20: server.py **85701** → engine **85748** (started 22:14:08,
-owned :8080, serving this session). `"fit_max_tokens": true` in `strata-coder-iq1_m.json` is
-therefore LIVE — verified with a `max_tokens: 65530` request (over the 65536 ctx): 400 before
-the fix, 200 `"content":"OK"` after. My own restart attempt (server.py 85139, 22:14:27) raced
-the user's and died on the weight-arena cudaMalloc — see §"Issues found on the 2026-10-10 22:14
-restart".
+Live pair as of 2026-10-10 22:38: server.py **92970** → engine **93016** (started 22:34:01, owns :8080,
+serving this session). `"fit_max_tokens": true` in `strata-coder-iq1_m.json` is LIVE — re-verified after the
+restart with a `max_tokens: 65530` request → 200 `"content":"OK"`. The 22:14 pair (85701/85748) was stopped
+by the user's restart; my own 22:14:27 attempt (server.py 85139) raced it and died on the weight-arena
+cudaMalloc — see §"Issues found on the 2026-10-10 22:14 restart" and §"Restart 2026-10-10 22:34".
