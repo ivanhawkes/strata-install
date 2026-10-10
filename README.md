@@ -110,6 +110,10 @@ above is the canonical one. Setup is resumable — finished steps skip.)
       expert-cache 51.4% hits, engine uses ~9 GB VRAM of the 5060 Ti). ⚠️ Stopping the
       engine now kills this agent session. (Started twice by accident; the orphan pair
       killed — see Pitfalls.)
+- [x] **Live pair 2026-10-10 22:20: server.py 85701 → engine 85748** (started 22:14:08, owns
+      :8080, serves this session) with `--max-context 65536 --kv int8 --kv-resident 32768` and
+      `"fit_max_tokens": true` now LIVE. Restart issues found and documented — see §"Issues
+      found on the 2026-10-10 22:14 restart".
 
 ## Current blocker — RESOLVED (fix applied & verified)
 
@@ -225,17 +229,29 @@ change args): stop the current pair first — ⚠️ that ends any agent session
 then:
 
 ```sh
-# 1. stop the running Strata server (frees port 8080 + its ~9 GB VRAM)
-pkill -f 'serve/server.py'      # safe ONLY when no agent session runs on it
-nvidia-smi                      # wait until the 5060 Ti shows ~0 MiB used
+# 1. stop the running pair BY PID (server.py first: it owns :8080 and restarts a dead
+#    engine on its own, so killing the engine alone can bring a new one back)
+ss -ltnp | grep ':8080'                 # the LISTEN line names the server.py PID
+ps -eo pid,ppid,args | grep -E 'serve/server\.py|engine/strata' | grep -v grep   # pair + PPID
+kill <server_py_pid>; sleep 2; kill <engine_pid>; sleep 3
+kill -9 <server_py_pid> <engine_pid> 2>/dev/null
 
-# 2. start Strata (env exports are baked into the script; --open opens a browser tab)
+# 2. wait until the VRAM is actually back (-d is a DISPLAY keyword, not a GPU selector:
+#    `nvidia-smi -d <gpu name>` errors "Invalid combination of input arguments"; one line per GPU
+nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits   # → "0" / "13"
+#    who still holds it, if it will not drop:
+nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
+
+# 3. start ONLY when the port is free (a second pair steals no port but steals VRAM:
+#    its engine dies with "cudaMalloc(...) for the weight arena failed")
+ss -ltnp | grep ':8080' || echo free
 cd /home/ivan/strata-install/Strata
-nohup ./run-coder-iq1_m.sh > server.log 2>&1 &
-tail -f server.log            # first load takes a few minutes (58 GB model)
+nohup ./run-coder-iq1_m.sh > server-$(date +%H%M).log 2>&1 </dev/null &
+tail -f server-*.log          # cold first load: minutes. warm (58 GB in page cache):
+                              # ~20 s — the engine says "loaded 23.42 GiB at 2.93 GiB/s"
 
-# 3. verify
-curl -s http://127.0.0.1:8080/health        # → {"status":"ok"}
+# 4. verify
+curl -s http://127.0.0.1:8080/health        # → {"status":"ok","max_context":65536,...}
 curl -s http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"coder","messages":[{"role":"user","content":"Reply with exactly: OK"}]}'
@@ -249,6 +265,86 @@ Notes:
   with `--vram-reserve-mib 1500`.
 - Several concurrent agents/clients: add `--conversation-cache-mib 8192` to the config's
   args (otherwise each re-reads ~90% of its prompts; #882 #440).
+- The `"fit_max_tokens": true` now in `strata-coder-iq1_m.json` only takes effect from the NEXT
+  start (the run config is read once, when `serve/server.py` builds the `Service`) — restarting
+  is the only way to apply it, and it ends the session running on the server. It has been applied
+  this way since 2026-10-10 22:14; see §"Request-level fix" and §"Issues found on the 2026-10-10
+  22:14 restart".
+
+## Request-level fix — 400 `prompt + max tokens exceeds the context` (fixed 2026-10-10 21:58)
+
+The agent session running on this server (pi, `llama-cpp/qwen3.8-flash-next-coder-iq1_m`) got:
+
+```
+Error: 400: {"type":"invalid_request_error","message":"prompt (51198 tokens) + max tokens (16384)
+exceeds the context (65536); requests are never truncated. Send a smaller max_tokens (at most 14330 here),
+or add \"fit_max_tokens\": true to the model's strata-<model>.json to shorten it to the room left (#545)"}
+```
+
+**Cause** — pi's llama.cpp extension always asks for `max_tokens = min(16384, n_ctx)` = 16384
+(`DEFAULT_MAX_TOKENS` in `/tmp/jiti/pi-llama-index.*.mjs`), and Strata refuses instead of truncating
+(`serve/server.py` `prepare()`, #545). Once a session's prompt passes `65536 - CTX_SLACK - 16384` ≈ 49 k
+ tokens, every request is refused — the session looks alive but stalls. pi's compaction
+(`triggerThreshold: 0.75` → 49152 tokens) runs between turns, not inside a long tool-heavy turn, so the
+prompt can pass the threshold before the next compaction.
+
+**Fix applied** — added `"fit_max_tokens": true` to `Strata/strata-coder-iq1_m.json`: the server clamps the
+requested output cap to the room left (`room = max_context - CTX_SLACK - prompt`) instead of answering 400.
+It is a `runconfig.EDITABLE` key (Strata's Settings page `POST /config` and a re-run of `setup.py` both keep
+it); `--fit-max-tokens` is the CLI equivalent, and `serve/test_server.py` (PR #24) covers the clamp. A prompt
+that leaves **no** room at all is still refused — that is the honest answer (compact or restart the session).
+
+**Takes effect at the NEXT start only** — the file was patched at 21:58 while the old pair (server.py 76675
+→ engine 76721) still refused; the 22:14 restart made it live (pair 85701/85748 — see §"Issues found on
+the 2026-10-10 22:14 restart"). Do NOT restart while an agent session is still running on the server: it
+ends that session (this one runs on Strata).
+
+Alternatives, if ever preferred: raise `--max-context` (more KV RAM), or make the client ask for less
+(`max_tokens ≤ room`, e.g. a `modelOverrides` `maxTokens` for this model in `~/.pi/agent/models.json`).
+`fit_max_tokens` is preferred: server-wide, client-agnostic, and it never truncates a reply that fits.
+
+## Issues found on the 2026-10-10 22:14 restart (all verified, none open)
+
+Restarting to make `fit_max_tokens` live surfaced five things worth keeping:
+
+1. **Two pairs raced.** The user's restart (server.py **85701** → engine **85748**, started
+   22:14:08) and my scripted one (server.py 85139 → engine at engine-log line 385, 22:14:27)
+   overlapped by ~19 s. Mine lost: its engine printed
+   `cudaMalloc(1475120640) for the weight arena failed (out of memory): 681 MiB of 15938 MiB
+   VRAM free on this GPU. The arena is allocated first, before the KV and expert caches:
+   another program (or an engine that is still exiting) holds the rest`, then server.py raised
+   inside `StrataEngine(...)` (server.py:5720) and exited. The user's pair loaded fine
+   (`loaded 23.42 GiB at 2.93 GiB/s`, expert cache 4257 slots / 8.10 GiB, `394 MiB of VRAM
+   free with everything loaded`) and is what serves this session now. **Check `ss -ltnp | grep
+   :8080` and the VRAM query before starting, not after.**
+2. **`nvidia-smi -d <gpu name>` is not a GPU selector** (driver 615.71.09): it prints
+   `Invalid combination of input arguments. Specify -q/--query and -d/--display to run a filtered
+   query.` — `-d` is a *display* keyword, not a GPU selector, so a `while` loop built on it never
+   breaks and just stalls ~2 min. Use `nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits`
+   (one line per GPU, 5060 Ti first: `15544` / `13` while the engine runs, `0` when its VRAM is gone)
+   or `--query-compute-apps=pid,process_name,used_memory` to see who holds it.
+3. **server.py auto-restarts its engine** — `restart()` (serve/server.py:845) with
+   `RESTART_RETRY_S = 15.0`, commented "a dying engine's VRAM may take a while to come back".
+   So killing only the engine can bring a new one back; kill **server.py first** (it owns :8080),
+   then its engine child.
+4. **Two processes writing the same `server.log` interleave mid-line** — the traceback from the
+   dead pair and the live pair's `ready: http://127.0.0.1:8080/v1` spliced into one line. Give
+   each start its own log name (`server-$(date +%H%M).log`) when restarting from a script.
+5. **`/health` reports more than the README claimed:**
+   `{"status":"ok","max_context":65536,"model":"qwen3.8-flash-next-coder-iq1_m","images":false,
+   "api_key":false,"loaded":true,"service":"strata"}` — `max_context` is the live ctx, so a
+   client can size its `max_tokens` from it instead of guessing.
+
+Cheap way to test `fit_max_tokens` **without** restarting: ask for more than the context —
+`{"model":"coder","messages":[{"role":"user","content":"Reply with exactly: OK"}],"max_tokens":65530}`
+→ 400 `prompt (57 tokens) + max tokens (65530) exceeds the context (65536)` before the fix, 200
+`"content":"OK"` after it (clamped to the room left). No 50 k-token prompt needed.
+
+Also seen while restarting (harmless, engine self-reports): `PCIe probe failed -> pcie_frac
+0.55` on a start whose libcuda was missing (fix #7), `this CPU has no AVX-512: the expert
+kernels run on AVX-2`, `MAP_HUGETLB unavailable ... transparent huge pages requested`, and
+`prefill: the CPU share is ON ... answers can differ slightly from 0.1.40.3` — all expected on
+this box; `STRATA_PREFILL_CPU_SHARE=0` turns the last one off.
 
 ## Pitfalls / notes for resuming
 
@@ -258,6 +354,15 @@ Notes:
   the ORPHAN pair by explicit PID — server.py first, then its engine (else server.py may
   respawn one). Never blind-`pkill -f 'serve/server.py'` while an agent session runs on
   the server: it kills the serving one too.
+
+- A second pair started while the first still holds VRAM dies with
+  `cudaMalloc(...) for the weight arena failed ... another program (or an engine that is
+  still exiting) holds the rest` — that is the VRAM message above, not a model problem.
+  Free the port and the VRAM **before** starting, and never assume `pkill` finished.
+
+- `nvidia-smi -d <gpu name>` is not a GPU selector (driver 615.71.09): it errors
+  `Invalid combination of input arguments ... Specify -q/--query and -d/--display`. A wait
+  loop built on it never terminates. Use `--query-gpu=...` / `--query-compute-apps=...` instead.
 
 - The old `-U_GNU_SOURCE` wrapper hack is gone (it broke libstdc++, error class 2);
   the permanent fix is the patched CUDA header. `_GNU_SOURCE` is back and fine now.
@@ -281,3 +386,10 @@ Notes:
   engine process — CUDA lib paths handled at runtime by the server itself.
 - Real g++ (bypassing NixOS wrapper): `/nix/store/8sjgd7q3mdks1rb7rbcv0sallhvrhai5-gcc-15.3.0/bin/g++`.
 - glibc 2.44 store path: `/nix/store/h4wfwic161kxrr74jlzla5lsm28hgary-glibc-2.44-25`.
+
+Live pair as of 2026-10-10 22:20: server.py **85701** → engine **85748** (started 22:14:08,
+owned :8080, serving this session). `"fit_max_tokens": true` in `strata-coder-iq1_m.json` is
+therefore LIVE — verified with a `max_tokens: 65530` request (over the 65536 ctx): 400 before
+the fix, 200 `"content":"OK"` after. My own restart attempt (server.py 85139, 22:14:27) raced
+the user's and died on the weight-arena cudaMalloc — see §"Issues found on the 2026-10-10 22:14
+restart".
