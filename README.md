@@ -2,7 +2,7 @@
 
 Setup of [Strata](https://github.com/Niko1221/Strata) v0.1.41 per `docs/AI_SETUP.md`, on a
 **NixOS 26.11** machine (devenv sandbox). This file is the single source of truth for
-resuming — it is updated as each discovery is made.
+resuming — updated as each discovery is made. **Read top to bottom before acting.**
 
 ## Mission & choices
 
@@ -24,12 +24,13 @@ resuming — it is updated as each discovery is made.
 ## Layout
 
 - `Strata/` — repo v0.1.41, `.venv/`, `setup.log`, `build/` (CMake build dir)
-- `Strata-data/` — model files (created by setup; ~58 GB download not started yet)
+- `Strata-data/` — model files (~58 GB download **not started yet**; build fails first)
 - `~/cuda-13.0/` — CUDA Toolkit 13.0, installed locally from NVIDIA debs (no sudo)
-- `~/cuda-13.0/nvcc.sh` — **nvcc wrapper (use this as STRATA_NVCC)**
-- `~/.local/bin/{cmake,ninja}` — absolute symlinks into the venv (see fix #6)
+- `~/cuda-13.0/nvcc.sh` — nvcc wrapper (**currently contains `-Xcompiler -U_GNU_SOURCE` — see §"Current blocker", this must change**)
+- `~/.local/bin/{cmake,ninja}` — absolute symlinks into the venv (fix #6)
+- `/tmp/cudatest/` — minimal `.cu` repro files from earlier diagnosis (may still exist)
 
-## NixOS problems found → fixes applied
+## NixOS problems found → fixes applied (all verified working)
 
 This box: `/lib64/ld-linux-x86-64.so.2` is a **musl stub** and `ldconfig -p` is
 **empty**. Every dynamically linked "generic Linux" binary fails until patched.
@@ -52,29 +53,10 @@ This box: `/lib64/ld-linux-x86-64.so.2` is a **musl stub** and `ldconfig -p` is
    you add more debs).
 6. **cmake/ninja relative path** — `setup.sh` runs python via a relative path, so
    `find_tool()` returned `.venv/bin/ninja` (relative) → CMake's scratch-dir try_compile
-   failed ("no such file or directory"). Fixed: absolute symlinks in `~/.local/bin`
-   (already on PATH), which `shutil.which` finds first.
-7. **rsqrt header conflict (the big one)** — nvcc's host compile of any `.cu` file
-   fails with GCC 15 + glibc 2.42 headers:
-   ```
-   bits/mathcalls.h(206): error: exception specification is incompatible with that of
-   previous function "rsqrt" (declared at line 629 of .../crt/math_functions.h)
-   ```
-   Root cause chain (fully diagnosed, repro in `/tmp/cudatest`):
-   - nvcc force-includes `cuda_runtime.h` → CUDA's `crt/math_functions.h` declares
-     `rsqrt/rsqrtf` **without** noexcept;
-   - nvcc passes **`-D_GNU_SOURCE`** to the host compiler (verified: it appears as a
-     `<command-line>` define in the preprocessed stream);
-   - `_GNU_SOURCE` enables glibc's `IEC_60559_FUNCS_EXT_C23` guard, which declares
-     `rsqrt/rsqrtf` **with** `noexcept(true)` → incompatible redeclaration, hard error.
-     (On Ubuntu this never triggers — that's why Strata builds there.)
-   - **Fix: `-Xcompiler -U_GNU_SOURCE`.** Verified: minimal `.cu` compiles cleanly with it.
-   - Applied via wrapper `~/cuda-13.0/nvcc.sh`:
-     `exec /home/ivan/cuda-13.0/usr/local/cuda-13.0/bin/nvcc -Xcompiler -U_GNU_SOURCE "$@"`
-     → **`STRATA_NVCC=/home/ivan/cuda-13.0/nvcc.sh`** (setup.py passes it as
-     `-DCMAKE_CUDA_COMPILER`, so every CUDA compile gets the flag).
+   failed. Fixed: absolute symlinks in `~/.local/bin` (already on PATH), which
+   `shutil.which` finds first.
 
-## Environment for running setup (all verified)
+## Environment for running setup (canonical resume command)
 
 ```sh
 cd /home/ivan/strata-install/Strata
@@ -84,30 +66,115 @@ export STRATA_NVCC=/home/ivan/cuda-13.0/nvcc.sh
 nohup ./setup.sh --yes --family coder --model IQ1_M --no-start > setup.log 2>&1 &
 ```
 
-(`LD_LIBRARY_PATH` + `SSL_CERT_FILE` are already in `.venv/bin/activate`; the resume
-command above is the canonical one.)
+(`LD_LIBRARY_PATH` + `SSL_CERT_FILE` are already in `.venv/bin/activate`; the command
+above is the canonical one. Setup is resumable — finished steps skip.)
 
-## Current state (checkpoint)
+## Progress so far (latest run)
 
-- [x] Repo cloned, venv + Python deps OK (numpy verified)
-- [x] CUDA 13.0 toolkit complete at `~/cuda-13.0` (incl. cicc), all executables patched
-- [x] rsqrt conflict diagnosed and fixed (nvcc wrapper); minimal `.cu` compiles
-- [ ] **NEXT: resume setup** with the env above → engine compile for sm_120 (10–40 min)
-      → ~58 GB model download into `Strata-data/`. Setup is resumable; finished steps skip.
-- [ ] After build: patchelf the engine binary `Strata/engine/strata` (generic Linux ELF,
-      would hit the stub loader) — same command as fix #1.
-- [ ] Edit generated `Strata/run-coder-iq1_m.sh`: it only does `cd` + `exec .venv/bin/python
-      serve/server.py --engine strata --config ... --port 8080`; add the two exports from
-      the env block above (server.py itself prepends the CUDA lib dirs to LD_LIBRARY_PATH
-      from the config's `lib_dirs`, so no CUDA paths needed there).
+- [x] CMake **configure now succeeds** (compiler-ID test passes with the wrapper).
+- [x] Ninja build started; **14/121 objects compiled** (all ggml-cpu .cpp/.c fine).
+- [x] Strata's own `.cu` files fail: `src/core/device.cu` (6 errors),
+      `src/core/pinned.cu` (29 errors) — see "Current blocker".
+- [ ] Model download (~58 GB into `Strata-data/`) — not started.
+- [ ] After build: patchelf engine binary `Strata/engine/strata` (+ `strata-vision` if
+      present) with the glibc 2.44 loader (same command as fix #1).
+- [ ] Edit generated `Strata/run-coder-iq1_m.sh`: it only does `cd` +
+      `exec .venv/bin/python serve/server.py --engine strata --config ... --port 8080`;
+      add the two exports from the env block above (server.py itself prepends CUDA lib
+      dirs to LD_LIBRARY_PATH from config `lib_dirs`, so no CUDA paths needed there).
 - [ ] Start server, poll `http://127.0.0.1:8080/health`, send a test chat.
+
+## Current blocker (fully diagnosed; fix NOT yet applied)
+
+### Error class 1 — rsqrt conflict (fixed by `-U_GNU_SOURCE`, but that fix is wrong)
+
+With plain nvcc (which force-injects `-D_GNU_SOURCE` into the host compile):
+```
+bits/mathcalls.h(206): error: exception specification is incompatible with that of
+previous function "rsqrt" (declared at line 629 of .../crt/math_functions.h)
+```
+Root cause chain (verified):
+- nvcc force-includes `cuda_runtime.h` → CUDA's `crt/math_functions.h` declares
+  `rsqrt`/`rsqrtf` in **global scope, C++ linkage, no exception spec** (lines 629/653).
+- nvcc passes `-D_GNU_SOURCE` to the host compiler.
+- `_GNU_SOURCE` makes glibc 2.42's `bits/mathcalls.h` (line 192:
+  `#if __GLIBC_USE(IEC_60559_FUNCS_EXT_C23)`) declare `rsqrt`/`rsqrtf` in **extern "C",
+  with `__THROW`** (line 206). → incompatible redeclaration, hard error under GCC 15.
+- CUDA's other math fns (sqrt, fabs, …) are declared inside `namespace std { }` in
+  math_functions.h, so they never conflict — **only global-scope rsqrt/rsqrtf do**.
+- On Ubuntu this never triggers (older glibc / no `_GNU_SOURCE` by default).
+
+### Error class 2 — `-U_GNU_SOURCE` breaks libstdc++ POSIX declarations (NEW)
+
+Removing `_GNU_SOURCE` fixed class 1 but Strata's `.cu` files then fail with:
+```
+cwchar(150): the global scope has no "fwide" / "fwscanf" / "swscanf" / "wscanf"
+bits/c++locale.h(52): identifier "uselocale" is undefined / "__locale_t"
+gthr-default.h(815): "pthread_mutex_timedlock" / "PTHREAD_MUTEX_RECURSIVE" /
+                     "pthread_mutexattr_settype" undefined
+bits/std_mutex.h: "clockid_t" / "pthread_cond_clockwait" undefined
+bits/atomic_wait.h(114): "syscall" is undefined
+pinned.cu(714): "fseeko" is undefined
+```
+Root cause: nvcc uses strict `-std=c++17` (no `_DEFAULT_SOURCE`), and with
+`_GNU_SOURCE` removed, glibc's feature-test guards declare almost nothing, so libstdc++
+headers reference undeclared POSIX identifiers. Note `syscall` is **GNU-only** in
+glibc (`__USE_GNU`), so plain `_POSIX_C_SOURCE`/`_XOPEN_SOURCE` likely won't cover it —
+a partial feature-macro fix is probably insufficient.
+
+### Key structural facts (for the fix)
+
+CUDA header: `~/cuda-13.0/usr/local/cuda-13.0/targets/x86_64-linux/include/crt/math_functions.h`
+- Line ~120–130: `__NV_GLIBC_PROVIDES_IEC_60559_FUNCS` = 1 only if
+  `__GNUC_PREREQ(2,41) && (__GLIBC_USE_ISOC23 || __STDC_WANT_IEC_60559_FUNCS_EXT__)`.
+  In our C++ build both are false ⇒ macro = **0** (so its existing guards don't help us).
+- Line 158: `extern "C" {` … closes line 289 (only a small section).
+- Line 629: `extern __DEVICE_FUNCTIONS_DECL__ __device_builtin__ double rsqrt(double x);`
+- Line 653: `extern __DEVICE_FUNCTIONS_DECL__ __device_builtin__ float rsqrtf(float x);`
+- Line 2567: macro used to give sinpi/cospi a `__THROW` spec when glibc provides them.
+- `__DEVICE_FUNCTIONS_DECL__` = `__host__ __device__` (non-RTC, line ~5465).
+
+glibc headers (read-only Nix store): `/nix/store/lbjwxax9n0457lgd83rqwpd1l9lgfl7r-glibc-2.42-84-dev/include/`
+- `bits/mathcalls.h` line 192: `#if __GLIBC_USE (IEC_60559_FUNCS_EXT_C23)` … line 206:
+  `__MATHCALL (rsqrt,, (_Mdouble_ __x));` (extern "C", `__THROW`).
+- Exact expansion of `__GLIBC_USE(IEC_60559_FUNCS_EXT_C23)` in features.h **not yet
+  verified** — empirically `_GNU_SOURCE` triggers it.
+
+### Recommended fix (next session, in order)
+
+1. **Patch the local CUDA header** (writable copy!) `math_functions.h`: make lines 629
+   and 653 compatible with glibc's declaration, e.g.:
+   ```c
+   extern "C" __host__ __device__ __device_builtin__ double rsqrt(double x) noexcept(true);
+   extern "C" __host__ __device__ __device_builtin__ float  rsqrtf(float x) noexcept(true);
+   ```
+   (matches glibc's C linkage + `__THROW`; keeps `__device__` for device code).
+   Alternative: wrap both in `#if !defined(_GNU_SOURCE)` and rely on glibc's own
+   declaration (slightly riskier for device-code builtin mapping — try the first form).
+2. **Revert the wrapper** `~/cuda-13.0/nvcc.sh` to plain passthrough (remove
+   `-Xcompiler -U_GNU_SOURCE`) so `_GNU_SOURCE` is back and libstdc++ works:
+   ```sh
+   #!/bin/sh
+   exec /home/ivan/cuda-13.0/usr/local/cuda-13.0/bin/nvcc "$@"
+   ```
+3. **Verify** with a minimal `.cu` that includes `<cuda_runtime.h>`, `<cwchar>`,
+   `<mutex>`, `<cmath>` and calls `rsqrt(1.0)` — must compile cleanly (check the .o
+   exists; nvcc flag syntax is `-std=c++17`, NOT `--c++17`).
+4. **Resume setup** with the canonical command above. If further `.cu` files fail with
+   new error classes, append them to this README and iterate — only Strata's own `.cu`
+   files are affected so far; ggml (C/C++) compiles fine.
+
+Fallbacks if the header patch misbehaves:
+- Copy glibc's include tree to a writable dir, remove rsqrt/rsqrtf from
+  `bits/mathcalls.h`, add `-Xcompiler -isystem <that-dir>` in the wrapper.
+- Or use an older glibc dev package (e.g. 2.39) headers via `-isystem` if its math.h
+  lacks the C23 rsqrt declaration (unverified which version added it).
 
 ## Pitfalls / notes for resuming
 
-- **nvcc flag syntax**: `-std=c++17`, NOT `--c++17` (an early "passing" test was bogus
-  because of this — always check the object file exists).
-- Don't wipe `Strata/build/` unnecessarily; setup re-passes all `-D` flags each run,
-  which override stale CMake cache values.
+- **Do NOT keep `-U_GNU_SOURCE`** — verified to break libstdc++ (error class 2 above).
+- Don't wipe `Strata/build/`; setup re-passes all `-D` flags each run, overriding stale
+  CMake cache values.
 - Watch progress: `tail -f Strata/setup.log`. Silence during compile is normal (ninja +
   cicc are slow); don't kill it.
 - If a new "cannot run dynamically linked executable" / stub-ld error appears for some
@@ -115,3 +182,13 @@ command above is the canonical one.)
 - Model download ~58 GB; resumable if interrupted.
 - GPU selection should default to the RTX 5060 Ti (most VRAM); images off; ctx 65536;
   KV cache 8-bit (setup defaults, already accepted with --yes).
+- CMake build command (setup.py ~line 3221): `cmake -G Ninja -DCMAKE_MAKE_PROGRAM=<ninja>
+  -S <Strata> -B <build> -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON
+  -DSTRATA_BUILD_TESTS=OFF -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_CUDA_COMPILER=<nvcc>
+  -DCUDAToolkit_ROOT=<toolkit> -DSTRATA_GGML_DIR=<llama.cpp>`.
+- Engine binary: `Strata/engine/strata` (EXE="strata"), vision encoder
+  `Strata/engine/strata-vision` (VEXE="strata-vision"). Both need patchelf after build.
+- `serve/server.py` `child_env()` prepends `cfg["lib_dirs"]` to LD_LIBRARY_PATH for the
+  engine process — CUDA lib paths handled at runtime by the server itself.
+- Real g++ (bypassing NixOS wrapper): `/nix/store/8sjgd7q3mdks1rb7rbcv0sallhvrhai5-gcc-15.3.0/bin/g++`.
+- glibc 2.44 store path: `/nix/store/h4wfwic161kxrr74jlzla5lsm28hgary-glibc-2.44-25`.
